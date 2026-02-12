@@ -6,6 +6,7 @@ venv/
 
 # Reports (may contain account IDs, IPs, ARNs)
 report-*.json
+reports/
 *.json.gz
 
 # Baseline (contains account-specific activity data)
