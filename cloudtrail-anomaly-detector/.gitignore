@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Reports (may contain account IDs, IPs, ARNs)
+report-*.json
+*.json.gz
+
+# Baseline (contains account-specific activity data)
+.cloudtrail_baseline.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

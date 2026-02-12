@@ -10,9 +10,11 @@ import functools
 import gzip
 import hashlib
 import json
+import os
 import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import numpy as np
 from sklearn.ensemble import IsolationForest
@@ -286,6 +288,223 @@ def prefilter_events(events):
     return flagged, stats
 
 
+# ── Persistent baseline ──────────────────────────────────────────────────────
+
+DEFAULT_BASELINE_PATH = os.path.join(Path.home(), ".cloudtrail_baseline.json")
+
+EMPTY_BASELINE = {
+    "version": 1,
+    "total_events": 0,
+    "runs": 0,
+    "dates_processed": [],
+    "last_updated": None,
+    "event_names": {},       # name → count
+    "event_sources": {},     # service → count
+    "users": {},             # arn → {"count": N, "first_seen": date, "last_seen": date}
+    "ips": {},               # ip → {"count": N, "first_seen": date, "last_seen": date}
+    "regions": {},           # region → count
+    "user_agents": {},       # truncated UA → count
+    "hour_by_user": {},      # arn → {"0": N, "1": N, ...}
+}
+
+
+def load_baseline(path):
+    """Load baseline from JSON file, or return empty baseline."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            bl = json.load(f)
+        print(f"{CYAN}Loaded baseline: {bl['total_events']} events across "
+              f"{bl['runs']} run(s), last updated {bl['last_updated']}{RESET}")
+        return bl
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"{YELLOW}Baseline file corrupt ({e}), starting fresh.{RESET}")
+        return None
+
+
+def save_baseline(bl, path):
+    """Write baseline to JSON file."""
+    with open(path, "w") as f:
+        json.dump(bl, f, indent=2, default=str)
+    print(f"{GREEN}Baseline saved: {bl['total_events']} total events, "
+          f"{bl['runs']} run(s) → {path}{RESET}")
+
+
+def _event_user(ev):
+    """Extract a consistent user identifier from a CloudTrail event."""
+    uid = ev.get("userIdentity", {})
+    return uid.get("arn", "") or uid.get("userName", "") or ""
+
+
+def _event_date_str(ev):
+    """Extract date string (YYYY-MM-DD) from an event."""
+    dt = _parse_event_time(ev)
+    if dt:
+        return dt.strftime("%Y-%m-%d")
+    return ""
+
+
+def update_baseline(bl, events, run_label=""):
+    """Merge current events into the baseline and return it.
+
+    Tracks:
+      - Cumulative frequency counters for event names, sources, regions
+      - Per-user and per-IP: count, first_seen, last_seen dates
+      - Per-user hour-of-day distribution
+    """
+    if bl is None:
+        bl = json.loads(json.dumps(EMPTY_BASELINE))  # deep copy
+
+    bl["runs"] += 1
+    bl["last_updated"] = datetime.now(timezone.utc).isoformat()
+    if run_label:
+        bl["dates_processed"].append(run_label)
+
+    for ev in events:
+        bl["total_events"] += 1
+
+        name = ev.get("eventName", "")
+        source = ev.get("eventSource", "")
+        ip = ev.get("sourceIPAddress", "")
+        region = ev.get("awsRegion", "")
+        user = _event_user(ev)
+        date_str = _event_date_str(ev)
+
+        # Simple counters
+        bl["event_names"][name] = bl["event_names"].get(name, 0) + 1
+        bl["event_sources"][source] = bl["event_sources"].get(source, 0) + 1
+        bl["regions"][region] = bl["regions"].get(region, 0) + 1
+
+        # User tracking with first/last seen
+        if user:
+            if user not in bl["users"]:
+                bl["users"][user] = {"count": 0, "first_seen": date_str, "last_seen": date_str}
+            bl["users"][user]["count"] += 1
+            if date_str and date_str < bl["users"][user]["first_seen"]:
+                bl["users"][user]["first_seen"] = date_str
+            if date_str and date_str > bl["users"][user]["last_seen"]:
+                bl["users"][user]["last_seen"] = date_str
+
+        # IP tracking with first/last seen
+        if ip:
+            if ip not in bl["ips"]:
+                bl["ips"][ip] = {"count": 0, "first_seen": date_str, "last_seen": date_str}
+            bl["ips"][ip]["count"] += 1
+            if date_str and date_str < bl["ips"][ip]["first_seen"]:
+                bl["ips"][ip]["first_seen"] = date_str
+            if date_str and date_str > bl["ips"][ip]["last_seen"]:
+                bl["ips"][ip]["last_seen"] = date_str
+
+        # Hour-of-day per user
+        if user:
+            dt = _parse_event_time(ev)
+            if dt:
+                h = str(dt.hour)
+                if user not in bl["hour_by_user"]:
+                    bl["hour_by_user"][user] = {}
+                bl["hour_by_user"][user][h] = bl["hour_by_user"][user].get(h, 0) + 1
+
+    return bl
+
+
+def detect_new_activity(events, baseline):
+    """Compare current events against baseline to find never-before-seen activity.
+
+    Returns a list of findings with category, value, and the triggering event.
+    """
+    if baseline is None:
+        return []
+
+    findings = []
+    # Track what we've already reported to avoid duplicates
+    seen_new_users = set()
+    seen_new_ips = set()
+    seen_new_events = set()
+    seen_new_sources = set()
+    seen_unusual_hours = set()
+
+    bl_users = baseline.get("users", {})
+    bl_ips = baseline.get("ips", {})
+    bl_names = baseline.get("event_names", {})
+    bl_sources = baseline.get("event_sources", {})
+    bl_hours = baseline.get("hour_by_user", {})
+
+    for ev in events:
+        user = _event_user(ev)
+        ip = ev.get("sourceIPAddress", "")
+        name = ev.get("eventName", "")
+        source = ev.get("eventSource", "")
+
+        # New user (never seen in baseline)
+        if user and user not in bl_users and user not in seen_new_users:
+            seen_new_users.add(user)
+            findings.append({
+                "category": "NEW_USER",
+                "severity": "HIGH",
+                "value": user,
+                "detail": "User/role never seen in baseline history",
+                "event": ev,
+            })
+
+        # New source IP (never seen in baseline)
+        if ip and ip not in bl_ips and ip not in seen_new_ips:
+            # Skip internal AWS service IPs
+            if not ip.endswith(".amazonaws.com"):
+                seen_new_ips.add(ip)
+                findings.append({
+                    "category": "NEW_IP",
+                    "severity": "MEDIUM",
+                    "value": ip,
+                    "detail": "Source IP never seen in baseline history",
+                    "event": ev,
+                })
+
+        # New API call (never seen in baseline)
+        if name and name not in bl_names and name not in seen_new_events:
+            seen_new_events.add(name)
+            findings.append({
+                "category": "NEW_EVENT",
+                "severity": "MEDIUM",
+                "value": name,
+                "detail": "API call never seen in baseline history",
+                "event": ev,
+            })
+
+        # New service (never seen in baseline)
+        if source and source not in bl_sources and source not in seen_new_sources:
+            seen_new_sources.add(source)
+            findings.append({
+                "category": "NEW_SERVICE",
+                "severity": "MEDIUM",
+                "value": source,
+                "detail": "AWS service never seen in baseline history",
+                "event": ev,
+            })
+
+        # Unusual hour for known user
+        if user and user in bl_hours and user not in seen_unusual_hours:
+            dt = _parse_event_time(ev)
+            if dt:
+                h = str(dt.hour)
+                user_hour_dist = bl_hours[user]
+                total_user_events = sum(user_hour_dist.values())
+                hour_count = user_hour_dist.get(h, 0)
+                # Flag if this hour has < 1% of the user's historical activity
+                if total_user_events >= 50 and hour_count / total_user_events < 0.01:
+                    seen_unusual_hours.add(user)
+                    findings.append({
+                        "category": "UNUSUAL_HOUR",
+                        "severity": "LOW",
+                        "value": f"{user} at hour {dt.hour}:00 UTC",
+                        "detail": (f"User has {hour_count}/{total_user_events} historical "
+                                   f"events at this hour ({hour_count/total_user_events*100:.1f}%)"),
+                        "event": ev,
+                    })
+
+    return findings
+
+
 # ── ML-based anomaly detection (Isolation Forest) ────────────────────────────
 
 
@@ -310,11 +529,16 @@ def _parse_event_time(ev):
     return None
 
 
-def featurize_events(events):
+def featurize_events(events, baseline=None):
     """Convert CloudTrail events into numeric feature vectors.
 
+    When a baseline is provided, frequency features are computed against the
+    historical totals (baseline + current batch) instead of just the current
+    batch. This means a user seen 10,000 times in the baseline won't be
+    flagged as "rare" even if they only appear once today.
+
     Features per event:
-      0  event_name_freq      — how rare is this API call in the dataset
+      0  event_name_freq      — how rare is this API call
       1  event_source_freq    — how rare is this service
       2  user_freq            — how rare is this principal
       3  ip_hash              — hashed source IP (captures diversity)
@@ -326,17 +550,35 @@ def featurize_events(events):
       9  region_freq          — how rare is this region
      10  user_type_code       — ordinal for userIdentity.type
     """
-    # Pre-compute frequency tables from the full dataset
-    name_counts = Counter(ev.get("eventName", "") for ev in events)
-    source_counts = Counter(ev.get("eventSource", "") for ev in events)
-    ip_counts = Counter(ev.get("sourceIPAddress", "") for ev in events)
-    region_counts = Counter(ev.get("awsRegion", "") for ev in events)
-    user_counts = Counter(
-        ev.get("userIdentity", {}).get("arn", "") or
-        ev.get("userIdentity", {}).get("userName", "")
-        for ev in events
-    )
-    n = len(events)
+    # Build frequency tables: baseline + current batch combined
+    batch_name_counts = Counter(ev.get("eventName", "") for ev in events)
+    batch_source_counts = Counter(ev.get("eventSource", "") for ev in events)
+    batch_ip_counts = Counter(ev.get("sourceIPAddress", "") for ev in events)
+    batch_region_counts = Counter(ev.get("awsRegion", "") for ev in events)
+    batch_user_counts = Counter(_event_user(ev) for ev in events)
+
+    if baseline:
+        # Merge baseline counters with current batch
+        bl_total = baseline.get("total_events", 0)
+        name_counts = Counter(baseline.get("event_names", {}))
+        name_counts.update(batch_name_counts)
+        source_counts = Counter(baseline.get("event_sources", {}))
+        source_counts.update(batch_source_counts)
+        ip_counts = Counter({k: v["count"] for k, v in baseline.get("ips", {}).items()})
+        ip_counts.update(batch_ip_counts)
+        region_counts = Counter(baseline.get("regions", {}))
+        region_counts.update(batch_region_counts)
+        user_counts = Counter({k: v["count"] for k, v in baseline.get("users", {}).items()})
+        user_counts.update(batch_user_counts)
+        n = bl_total + len(events)
+        print(f"{CYAN}ML featurization using baseline context: {bl_total} historical + {len(events)} current = {n} total{RESET}")
+    else:
+        name_counts = batch_name_counts
+        source_counts = batch_source_counts
+        ip_counts = batch_ip_counts
+        region_counts = batch_region_counts
+        user_counts = batch_user_counts
+        n = len(events)
 
     user_type_map = {
         "Root": 0, "IAMUser": 1, "AssumedRole": 2, "FederatedUser": 3,
@@ -349,10 +591,7 @@ def featurize_events(events):
         source = ev.get("eventSource", "")
         ip = ev.get("sourceIPAddress", "")
         region = ev.get("awsRegion", "")
-        user_arn = (
-            ev.get("userIdentity", {}).get("arn", "") or
-            ev.get("userIdentity", {}).get("userName", "")
-        )
+        user_arn = _event_user(ev)
         user_type = ev.get("userIdentity", {}).get("type", "")
         error_code = ev.get("errorCode", "")
         read_only = ev.get("readOnly")
@@ -362,29 +601,29 @@ def featurize_events(events):
         dow = dt.weekday() if dt else 0
 
         features.append([
-            1.0 - (name_counts[name] / n),       # rare event name → higher
-            1.0 - (source_counts[source] / n),    # rare service → higher
-            1.0 - (user_counts[user_arn] / n),    # rare user → higher
-            _hash_encode(ip) / 64.0,              # IP diversity
-            1.0 - (ip_counts[ip] / n),            # rare IP → higher
-            hour / 23.0,                          # hour normalized
-            dow / 6.0,                            # day of week normalized
-            1.0 if error_code else 0.0,           # has error
-            0.0 if read_only is True else 1.0,    # write event
-            1.0 - (region_counts[region] / n),    # rare region → higher
-            user_type_map.get(user_type, 6) / 6.0,  # user type ordinal
+            1.0 - (name_counts.get(name, 0) / n),     # rare event name → higher
+            1.0 - (source_counts.get(source, 0) / n),  # rare service → higher
+            1.0 - (user_counts.get(user_arn, 0) / n),  # rare user → higher
+            _hash_encode(ip) / 64.0,                    # IP diversity
+            1.0 - (ip_counts.get(ip, 0) / n),          # rare IP → higher
+            hour / 23.0,                                # hour normalized
+            dow / 6.0,                                  # day of week normalized
+            1.0 if error_code else 0.0,                 # has error
+            0.0 if read_only is True else 1.0,          # write event
+            1.0 - (region_counts.get(region, 0) / n),  # rare region → higher
+            user_type_map.get(user_type, 6) / 6.0,     # user type ordinal
         ])
 
     return np.array(features)
 
 
-def analyze_with_ml(events, contamination=0.05, top_n=20):
+def analyze_with_ml(events, baseline=None, contamination=0.05, top_n=20):
     """Run Isolation Forest on featurized CloudTrail events.
 
     Returns a list of anomaly dicts sorted by anomaly score (most anomalous first).
     """
     print(f"{CYAN}ML analysis: featurizing {len(events)} events...{RESET}")
-    X = featurize_events(events)
+    X = featurize_events(events, baseline=baseline)
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -530,7 +769,7 @@ def severity_rank(sev):
     return {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}.get(sev, 5)
 
 
-def print_report(flagged, stats, ml_anomalies, ai_findings):
+def print_report(flagged, stats, new_activity, ml_anomalies, ai_findings):
     """Print color-coded terminal report."""
     print(f"\n{BOLD}{'=' * 70}{RESET}")
     print(f"{BOLD}  CloudTrail AI Anomaly Report{RESET}")
@@ -568,6 +807,25 @@ def print_report(flagged, stats, ml_anomalies, ai_findings):
             print()
     else:
         print(f"{GREEN}No rule-based flags.{RESET}\n")
+
+    # New activity (baseline comparison)
+    if new_activity:
+        cat_colors = {
+            "NEW_USER": RED, "NEW_IP": YELLOW, "NEW_EVENT": YELLOW,
+            "NEW_SERVICE": YELLOW, "UNUSUAL_HOUR": CYAN,
+        }
+        print(f"{BOLD}── New Activity vs. Baseline ({len(new_activity)}) ──{RESET}\n")
+        for fa in new_activity:
+            ev = fa["event"]
+            cat = fa["category"]
+            color = cat_colors.get(cat, YELLOW)
+            time = ev.get("eventTime", "?")
+            print(f"  {color}[{cat}] {fa['value']}{RESET}")
+            print(f"      {fa['detail']}")
+            print(f"      Event: {ev.get('eventName', '?')}  Time: {time}")
+            print()
+    elif new_activity is not None and len(new_activity) == 0:
+        print(f"{GREEN}No new activity vs. baseline.{RESET}\n")
 
     # ML anomaly findings
     if ml_anomalies:
@@ -620,7 +878,7 @@ def print_report(flagged, stats, ml_anomalies, ai_findings):
     print(f"{BOLD}{'=' * 70}{RESET}")
 
 
-def export_json(flagged, stats, ml_anomalies, ai_findings, path):
+def export_json(flagged, stats, new_activity, ml_anomalies, ai_findings, path):
     """Write machine-readable JSON report."""
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -637,6 +895,17 @@ def export_json(flagged, stats, ml_anomalies, ai_findings, path):
                 "reasons": item["reasons"],
             }
             for item in flagged
+        ],
+        "new_activity": [
+            {
+                "category": fa["category"],
+                "severity": fa["severity"],
+                "value": fa["value"],
+                "detail": fa["detail"],
+                "eventName": fa["event"].get("eventName"),
+                "eventTime": str(fa["event"].get("eventTime", "")),
+            }
+            for fa in (new_activity or [])
         ],
         "ml_anomalies": [
             {
@@ -751,6 +1020,22 @@ def parse_args():
         "--output-json", metavar="FILE", default=None, help="Export report as JSON to FILE"
     )
     parser.add_argument(
+        "--baseline-file", default=DEFAULT_BASELINE_PATH, metavar="FILE",
+        help=f"Path to baseline JSON file (default: {DEFAULT_BASELINE_PATH})"
+    )
+    parser.add_argument(
+        "--no-baseline", action="store_true",
+        help="Disable baseline load/save (single-run mode, no historical context)"
+    )
+    parser.add_argument(
+        "--reset-baseline", action="store_true",
+        help="Delete existing baseline and start fresh from this run"
+    )
+    parser.add_argument(
+        "--yesterday", action="store_true",
+        help="Convenience: analyze yesterday's S3 logs (requires --s3-uri)"
+    )
+    parser.add_argument(
         "--skip-ml", action="store_true", help="Skip ML anomaly detection"
     )
     parser.add_argument(
@@ -786,11 +1071,21 @@ def main():
     if (args.month or args.days) and not args.s3_uri:
         print(f"{RED}--month/--days require --s3-uri{RESET}")
         sys.exit(1)
+    if args.yesterday and not args.s3_uri:
+        print(f"{RED}--yesterday requires --s3-uri{RESET}")
+        sys.exit(1)
 
     month = args.month
     start_day, end_day = None, None
 
-    if args.s3_uri:
+    # --yesterday: auto-set month/day to yesterday's date
+    if args.yesterday:
+        yd = datetime.now(timezone.utc) - timedelta(days=1)
+        month = yd.month
+        start_day = end_day = yd.day
+        print(f"{CYAN}--yesterday: targeting {yd.strftime('%Y-%m-%d')}{RESET}")
+
+    if args.s3_uri and not args.yesterday:
         # Resolve month: from CLI or interactive prompt
         if month is None:
             month = prompt_month()
@@ -801,6 +1096,7 @@ def main():
         else:
             start_day, end_day = prompt_days(month)
 
+    if args.s3_uri:
         label_parts = [MONTH_NAMES[month]]
         if start_day is not None:
             if start_day == end_day:
@@ -808,6 +1104,14 @@ def main():
             else:
                 label_parts.append(f"days {start_day}-{end_day}")
         print(f"\n{CYAN}Retrieving logs for: {', '.join(label_parts)}{RESET}")
+
+    # 0. Load baseline
+    baseline = None
+    if not args.no_baseline:
+        if args.reset_baseline and os.path.exists(args.baseline_file):
+            os.remove(args.baseline_file)
+            print(f"{YELLOW}Baseline reset: {args.baseline_file}{RESET}")
+        baseline = load_baseline(args.baseline_file)
 
     # 1. Fetch events
     try:
@@ -828,29 +1132,52 @@ def main():
     # 2. Rule-based pre-filter
     flagged, stats = prefilter_events(events)
 
-    # 3. ML anomaly detection (Isolation Forest)
+    # 3. New-activity detection (compare against baseline)
+    new_activity = []
+    if baseline is not None:
+        print(f"{CYAN}Comparing events against baseline...{RESET}")
+        new_activity = detect_new_activity(events, baseline)
+        if new_activity:
+            print(f"{CYAN}Found {len(new_activity)} new-activity findings.{RESET}\n")
+        else:
+            print(f"{CYAN}No new activity vs. baseline.{RESET}\n")
+
+    # 4. ML anomaly detection (Isolation Forest with baseline context)
     ml_anomalies = None
     if not args.skip_ml:
         ml_anomalies = analyze_with_ml(
-            events, contamination=args.ml_contamination, top_n=args.ml_top_n
+            events, baseline=baseline,
+            contamination=args.ml_contamination, top_n=args.ml_top_n
         )
 
-    # 4. LLM analysis (optional — only on ML-flagged events if ML ran)
+    # 5. LLM analysis (optional — only on ML-flagged events if ML ran)
     ai_findings = []
     if not args.skip_ai:
         if ml_anomalies:
-            # Send only anomalous events to LLM (saves GPU heat!)
             anomaly_events = [a["event"] for a in ml_anomalies]
             print(f"{CYAN}Sending {len(anomaly_events)} ML-flagged events to LLM (instead of all {len(events)})...{RESET}")
             ai_findings = analyze_with_ai(anomaly_events, batch_size=args.batch_size)
         else:
             ai_findings = analyze_with_ai(events, batch_size=args.batch_size)
 
-    # 5. Report
-    print_report(flagged, stats, ml_anomalies, ai_findings)
+    # 6. Report
+    print_report(flagged, stats, new_activity, ml_anomalies, ai_findings)
 
     if args.output_json:
-        export_json(flagged, stats, ml_anomalies, ai_findings, args.output_json)
+        export_json(flagged, stats, new_activity, ml_anomalies, ai_findings, args.output_json)
+
+    # 7. Update and save baseline
+    if not args.no_baseline:
+        run_label = ""
+        if args.s3_uri and month:
+            parts = [f"month={month}"]
+            if start_day:
+                parts.append(f"days={start_day}-{end_day}" if end_day != start_day else f"day={start_day}")
+            run_label = ", ".join(parts)
+        elif args.hours:
+            run_label = f"last {args.hours}h"
+        baseline = update_baseline(baseline, events, run_label=run_label)
+        save_baseline(baseline, args.baseline_file)
 
 
 if __name__ == "__main__":
