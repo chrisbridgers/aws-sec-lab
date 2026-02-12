@@ -2,10 +2,11 @@
 
 CLI tool that retrieves AWS CloudTrail logs and analyzes them for security anomalies using a 4-tier detection pipeline with persistent historical context:
 
-1. **Rule-based** — instant pattern matching for known-bad events
+1. **Rule-based** — instant pattern matching for known-bad events (including root account activity)
 2. **Baseline comparison** — flags never-before-seen users, IPs, API calls, and services
-3. **ML (Isolation Forest)** — statistical outlier detection using baseline-aware frequency features
-4. **LLM (local)** — natural-language reasoning on ML-flagged events only
+3. **Impossible travel** — GeoIP-based detection of same user from distant locations in short time
+4. **ML (Isolation Forest)** — statistical outlier detection with GeoIP-annotated results
+5. **LLM (local)** — natural-language reasoning on ML-flagged events with geolocation context
 
 A persistent baseline file accumulates across runs, so the tool gets smarter over time. Activity that was normal yesterday won't be flagged today — but a brand-new IAM user or never-seen IP will be.
 
@@ -15,7 +16,8 @@ All analysis runs locally. No cloud AI APIs are called — CloudTrail data never
 
 - Python 3.10+
 - AWS credentials configured (`aws configure` or environment variables)
-- [LM Studio](https://lmstudio.ai/) running locally on port 1234 (optional, for Tier 4)
+- [LM Studio](https://lmstudio.ai/) running locally on port 1234 (optional, for Tier 5)
+- [MaxMind GeoLite2-City](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) database (optional, for impossible travel + IP geolocation)
 
 ## Installation
 
@@ -25,7 +27,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Dependencies: `boto3`, `openai`, `scikit-learn`, `numpy`
+Dependencies: `boto3`, `openai`, `scikit-learn`, `numpy`, `geoip2`
 
 ## Usage
 
@@ -119,8 +121,10 @@ The baseline file (`~/.cloudtrail_baseline.json`) persists across runs, accumula
 | `--skip-ml` | off | Skip ML anomaly detection (Tier 3) |
 | `--ml-contamination` | 0.05 | Expected anomaly fraction for Isolation Forest (0.01-0.10) |
 | `--ml-top-n` | 20 | Number of top ML anomalies to display |
-| `--skip-ai` | off | Skip LLM analysis (Tier 4) |
+| `--skip-ai` | off | Skip LLM analysis (Tier 5) |
 | `--batch-size` | 20 | Events per LLM analysis batch |
+| `--geoip-db FILE` | none | Path to MaxMind GeoLite2-City.mmdb for IP geolocation |
+| `--travel-speed MPH` | 500 | Impossible travel speed threshold in mph |
 | `--output-json FILE` | none | Export full report as JSON |
 
 ### Examples
@@ -144,6 +148,14 @@ python cloudtrail_analyzer.py \
 # Full pipeline with all 4 tiers (live API, last 48 hours)
 python cloudtrail_analyzer.py --hours 48 --output-json report.json
 
+# Enable GeoIP: impossible travel + IP annotations on ML/LLM tiers
+python cloudtrail_analyzer.py --hours 24 --skip-ai \
+  --geoip-db /path/to/GeoLite2-City.mmdb
+
+# Lower travel speed threshold for stricter detection
+python cloudtrail_analyzer.py --s3-logs --yesterday --skip-ai \
+  --geoip-db /path/to/GeoLite2-City.mmdb --travel-speed 300
+
 # Single-run mode (no baseline), rules + ML only
 python cloudtrail_analyzer.py --hours 24 --no-baseline --skip-ai
 
@@ -166,6 +178,7 @@ python cloudtrail_analyzer.py \
 
 ### Tier 1: Rule-Based (instant)
 Pattern matching against known-suspicious CloudTrail events:
+- **Root account activity** — any API call from the root account (always HIGH severity)
 - Failed console logins (`ConsoleLogin` with error)
 - `AccessDenied` / `UnauthorizedAccess` errors
 - IAM privilege escalation (CreateUser, AttachUserPolicy, CreateAccessKey, etc.)
@@ -186,7 +199,35 @@ Compares current events against the persistent baseline to detect never-before-s
 
 The baseline tracks per-entity first-seen and last-seen dates, cumulative frequency counters, and per-user hour-of-day distributions.
 
-### Tier 3: ML — Isolation Forest (seconds)
+### Tier 3: Impossible Travel (requires `--geoip-db`)
+Uses MaxMind GeoLite2-City to geolocate source IPs and detect physically impossible travel:
+
+- Groups events by user, sorts by timestamp
+- Geolocates each public IP (private/AWS-service IPs are skipped)
+- Calculates distance (haversine) and time delta between consecutive events from different IPs
+- Flags when implied travel speed exceeds threshold (default 500 mph)
+
+| Severity | Condition |
+|----------|-----------|
+| HIGH | Implied speed > 2,000 mph |
+| MEDIUM | Implied speed > 500 mph (configurable via `--travel-speed`) |
+
+Example output:
+```
+[HIGH] arn:aws:iam::123456789012:user/alice
+    From: 136.62.95.84 (Austin, US) at 2026-02-12T21:53:35Z  [DescribeTrails]
+    To:   31.171.152.203 (Tirana, AL) at 2026-02-12T22:02:37Z  [GetCostAndUsage]
+    Distance: 6,106 mi  Time: 9 min  Speed: 40,559 mph
+```
+
+When `--geoip-db` is provided, IP geolocation is also annotated on ML anomalies and included in LLM event summaries.
+
+To set up GeoIP:
+1. Create a free [MaxMind account](https://www.maxmind.com/en/geolite2/signup)
+2. Download `GeoLite2-City.mmdb` from the GeoIP2 downloads page
+3. Pass `--geoip-db /path/to/GeoLite2-City.mmdb`
+
+### Tier 4: ML — Isolation Forest (seconds)
 Featurizes each CloudTrail event into an 11-dimension numeric vector and runs scikit-learn's Isolation Forest to find statistical outliers.
 
 When a baseline exists, frequency features are computed against the **combined historical + current** dataset. This means a user seen 10,000 times in the baseline won't be flagged as "rare" even if they only appear once today.
@@ -207,7 +248,7 @@ When a baseline exists, frequency features are computed against the **combined h
 | `region_freq` | How rare this AWS region is |
 | `user_type_code` | User identity type (Root, IAMUser, AssumedRole, etc.) |
 
-### Tier 4: LLM Analysis (seconds, with ML pre-filter)
+### Tier 5: LLM Analysis (seconds, with ML pre-filter)
 When ML runs first, only the top ML-flagged events are sent to the LLM — typically ~20 events instead of thousands. This reduces LLM inference by 90%+ while focusing analysis on the most suspicious activity.
 
 The LLM provides:
@@ -218,13 +259,14 @@ The LLM provides:
 ## Output
 
 The terminal report includes:
-- **Event Summary** — counts of total events and each anomaly category
-- **Rule-Based Findings** — color-coded flags with event details
+- **Event Summary** — counts of total events and each anomaly category (including root activity count)
+- **Rule-Based Findings** — color-coded flags with event details (root activity in red)
 - **New Activity vs. Baseline** — never-before-seen users, IPs, API calls, services
-- **ML Anomaly Detection** — top outliers with anomaly scores and contributing features
-- **AI Analysis Findings** — LLM severity-ranked findings with explanations
+- **Impossible Travel** — geolocation-based travel speed violations with distance/time/speed
+- **ML Anomaly Detection** — top outliers with anomaly scores, contributing features, and IP geolocation
+- **AI Analysis Findings** — LLM severity-ranked findings with explanations and geolocation context
 
-JSON export (`--output-json`) contains all findings across all 4 tiers.
+JSON export (`--output-json`) contains all findings across all 5 tiers.
 
 ## Baseline File
 
