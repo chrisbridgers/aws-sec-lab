@@ -1,6 +1,6 @@
 # CloudTrail AI Anomaly Detector
 
-CLI tool that retrieves AWS CloudTrail logs and analyzes them for security anomalies using a 4-tier detection pipeline with persistent historical context:
+CLI tool that retrieves AWS CloudTrail logs and analyzes them for security anomalies using a 5-tier detection pipeline with persistent historical context:
 
 1. **Rule-based** — instant pattern matching for known-bad events (including root account activity)
 2. **Baseline comparison** — flags never-before-seen users, IPs, API calls, and services
