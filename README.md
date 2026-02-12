@@ -1,2 +1,2 @@
-# ai-labs
-For AI/ML stuff
+# ai-sec-lab
+For AWS related Security & AI/ML stuff
