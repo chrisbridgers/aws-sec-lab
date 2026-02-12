@@ -150,6 +150,87 @@ def parse_s3_uri(uri):
     return bucket, prefix
 
 
+def discover_trail_uri(region, profile, year=None):
+    """Auto-discover CloudTrail S3 bucket and build the year-level S3 URI.
+
+    Uses describe_trails() to find the bucket, sts to get the account ID,
+    and S3 listing to detect org-trail path structure.
+
+    Returns a fully-qualified S3 URI like:
+      s3://bucket/AWSLogs/org-id/acct-id/CloudTrail/region/YYYY/
+    """
+    session_kwargs = {}
+    if profile:
+        session_kwargs["profile_name"] = profile
+    session = boto3.Session(region_name=region, **session_kwargs)
+
+    ct_client = session.client("cloudtrail")
+    sts_client = session.client("sts")
+
+    # Get account ID
+    identity = sts_client.get_caller_identity()
+    account_id = identity["Account"]
+    print(f"{CYAN}Account: {account_id}{RESET}")
+
+    # Get trails
+    trails = ct_client.describe_trails().get("trailList", [])
+    if not trails:
+        print(f"{RED}No CloudTrail trails found in this account.{RESET}")
+        return None
+
+    # Pick the best trail: prefer multi-region or one homed in the requested region
+    trail = None
+    for t in trails:
+        if t.get("IsMultiRegionTrail"):
+            trail = t
+            break
+    if not trail:
+        for t in trails:
+            if t.get("HomeRegion") == region:
+                trail = t
+                break
+    if not trail:
+        trail = trails[0]
+
+    bucket = trail["S3BucketName"]
+    key_prefix = trail.get("S3KeyPrefix", "")
+    trail_name = trail.get("Name", "?")
+    is_org = trail.get("IsOrganizationTrail", False)
+
+    print(f"{CYAN}Trail: {trail_name}  Bucket: {bucket}  Org trail: {is_org}{RESET}")
+
+    # Build the base prefix: {key_prefix}/AWSLogs/
+    base = (key_prefix + "/") if key_prefix else ""
+    base += "AWSLogs/"
+
+    # For org trails, detect the org ID by listing one level under AWSLogs/
+    if is_org:
+        s3 = session.client("s3")
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=base, Delimiter="/", MaxKeys=10)
+        org_id = None
+        for cp in resp.get("CommonPrefixes", []):
+            part = cp["Prefix"].replace(base, "").strip("/")
+            if part.startswith("o-"):
+                org_id = part
+                break
+        if org_id:
+            base += f"{org_id}/{account_id}/CloudTrail/{region}/"
+        else:
+            print(f"{YELLOW}Org trail but couldn't detect org ID, trying non-org path.{RESET}")
+            base += f"{account_id}/CloudTrail/{region}/"
+    else:
+        base += f"{account_id}/CloudTrail/{region}/"
+
+    # Append year
+    if year is None:
+        year = datetime.now(timezone.utc).year
+    base += f"{year}/"
+
+    uri = f"s3://{bucket}/{base}"
+    print(f"{CYAN}Discovered S3 URI: {uri}{RESET}")
+    return uri
+
+
 def fetch_s3_events(s3_uri, profile, max_events, month=None,
                     start_day=None, end_day=None):
     """Download and parse CloudTrail log files from S3.
@@ -993,12 +1074,20 @@ def parse_args():
         description="CloudTrail AI Anomaly Detector — analyze AWS CloudTrail logs for security anomalies"
     )
     parser.add_argument(
+        "--s3-logs", action="store_true",
+        help="Auto-discover CloudTrail S3 bucket and analyze historical logs (no URI needed)"
+    )
+    parser.add_argument(
         "--s3-uri", default=None,
         help="S3 URI to CloudTrail year prefix (e.g. s3://bucket/AWSLogs/.../2025/). Overrides --hours/--region."
     )
     parser.add_argument(
+        "--year", type=int, default=None, metavar="YYYY",
+        help="Year for S3 logs (default: current year). Use with --s3-logs or --s3-uri."
+    )
+    parser.add_argument(
         "--month", type=int, default=None, metavar="MM",
-        help="Month to filter S3 logs (1-12). Use with --s3-uri. Prompted if omitted."
+        help="Month to filter S3 logs (1-12). Use with --s3-uri/--s3-logs. Prompted if omitted."
     )
     parser.add_argument(
         "--days", default=None, metavar="D or D-D",
@@ -1033,7 +1122,7 @@ def parse_args():
     )
     parser.add_argument(
         "--yesterday", action="store_true",
-        help="Convenience: analyze yesterday's S3 logs (requires --s3-uri)"
+        help="Convenience: analyze yesterday's S3 logs (requires --s3-uri or --s3-logs)"
     )
     parser.add_argument(
         "--skip-ml", action="store_true", help="Skip ML anomaly detection"
@@ -1067,12 +1156,26 @@ def parse_days_arg(days_str):
 def main():
     args = parse_args()
 
-    # Validate that --month/--days aren't used without --s3-uri
+    # Auto-discover S3 URI if --s3-logs is set
+    if args.s3_logs and not args.s3_uri:
+        print(f"{CYAN}Auto-discovering CloudTrail S3 configuration...{RESET}")
+        args.s3_uri = discover_trail_uri(args.region, args.profile, year=args.year)
+        if not args.s3_uri:
+            print(f"{RED}Could not auto-discover CloudTrail S3 bucket. Use --s3-uri instead.{RESET}")
+            sys.exit(1)
+
+    # If --year provided with existing --s3-uri, swap the year in the URI
+    if args.year and args.s3_uri and not args.s3_logs:
+        # Replace trailing YYYY/ with the requested year
+        import re
+        args.s3_uri = re.sub(r'/\d{4}/$', f'/{args.year}/', args.s3_uri)
+
+    # Validate that --month/--days aren't used without --s3-uri/--s3-logs
     if (args.month or args.days) and not args.s3_uri:
-        print(f"{RED}--month/--days require --s3-uri{RESET}")
+        print(f"{RED}--month/--days require --s3-uri or --s3-logs{RESET}")
         sys.exit(1)
     if args.yesterday and not args.s3_uri:
-        print(f"{RED}--yesterday requires --s3-uri{RESET}")
+        print(f"{RED}--yesterday requires --s3-uri or --s3-logs{RESET}")
         sys.exit(1)
 
     month = args.month
