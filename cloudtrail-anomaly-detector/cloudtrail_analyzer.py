@@ -10,9 +10,10 @@ import functools
 import gzip
 import hashlib
 import json
+import math
 import os
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,6 +26,13 @@ print = functools.partial(print, flush=True)
 
 import boto3
 from openai import OpenAI
+
+# Optional: GeoIP for impossible travel detection
+try:
+    import geoip2.database as geoip2_db
+    HAS_GEOIP = True
+except ImportError:
+    HAS_GEOIP = False
 
 # ── ANSI colors ──────────────────────────────────────────────────────────────
 
@@ -321,6 +329,7 @@ def prefilter_events(events):
         "tamper_actions": 0,
         "network_changes": 0,
         "sts_denied": 0,
+        "root_activity": 0,
     }
 
     for ev in events:
@@ -328,7 +337,13 @@ def prefilter_events(events):
         error_code = ev.get("errorCode", "")
         error_msg = ev.get("errorMessage", "")
         source = ev.get("eventSource", "")
+        user_type = ev.get("userIdentity", {}).get("type", "")
         reasons = []
+
+        # Root account activity — always suspicious
+        if user_type == "Root":
+            reasons.append(f"Root account activity: {name}")
+            stats["root_activity"] += 1
 
         # Failed console logins
         if name == "ConsoleLogin":
@@ -598,6 +613,150 @@ def detect_new_activity(events, baseline):
     return findings
 
 
+# ── Impossible travel detection (GeoIP) ──────────────────────────────────────
+
+def _is_public_ip(ip):
+    """Check if an IP is a public (non-AWS-service, non-private) address."""
+    if not ip or ip.endswith(".amazonaws.com"):
+        return False
+    # Skip RFC1918 private ranges
+    if ip.startswith(("10.", "172.16.", "172.17.", "172.18.", "172.19.",
+                      "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
+                      "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
+                      "172.30.", "172.31.", "192.168.", "127.", "169.254.")):
+        return False
+    return True
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Calculate the great-circle distance between two points in miles."""
+    R = 3958.8  # Earth radius in miles
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+class GeoIPResolver:
+    """Cached GeoIP lookups using MaxMind GeoLite2-City database."""
+
+    def __init__(self, db_path):
+        self._reader = geoip2_db.Reader(db_path)
+        self._cache = {}
+
+    def lookup(self, ip):
+        """Return (lat, lon, city, country) or None if lookup fails."""
+        if ip in self._cache:
+            return self._cache[ip]
+        try:
+            resp = self._reader.city(ip)
+            loc = resp.location
+            if loc.latitude is not None and loc.longitude is not None:
+                result = (loc.latitude, loc.longitude,
+                          resp.city.name or "?",
+                          resp.country.iso_code or "?")
+            else:
+                result = None
+        except Exception:
+            result = None
+        self._cache[ip] = result
+        return result
+
+    def close(self):
+        self._reader.close()
+
+
+def detect_impossible_travel(events, geoip_resolver, speed_threshold_mph=500):
+    """Detect impossible travel by comparing geolocation of consecutive events per user.
+
+    Groups events by user, sorts by time, and flags when the implied travel speed
+    between consecutive events from different IPs exceeds the threshold.
+
+    Args:
+        events: list of CloudTrail event dicts
+        geoip_resolver: GeoIPResolver instance
+        speed_threshold_mph: flag if implied speed exceeds this (default 500 mph)
+
+    Returns:
+        list of finding dicts with travel details
+    """
+    # Group events by user with timestamp + IP
+    user_events = defaultdict(list)
+    for ev in events:
+        user = _event_user(ev)
+        if not user:
+            continue
+        ip = ev.get("sourceIPAddress", "")
+        if not _is_public_ip(ip):
+            continue
+        dt = _parse_event_time(ev)
+        if not dt:
+            continue
+        user_events[user].append((dt, ip, ev))
+
+    findings = []
+    seen_pairs = set()  # avoid duplicate findings for same user+IP pair
+
+    for user, entries in user_events.items():
+        # Sort by time
+        entries.sort(key=lambda x: x[0])
+
+        for i in range(1, len(entries)):
+            dt_prev, ip_prev, ev_prev = entries[i - 1]
+            dt_curr, ip_curr, ev_curr = entries[i]
+
+            if ip_prev == ip_curr:
+                continue
+
+            # Deduplicate: only report each user+IP-pair once
+            pair_key = (user, tuple(sorted([ip_prev, ip_curr])))
+            if pair_key in seen_pairs:
+                continue
+
+            geo_prev = geoip_resolver.lookup(ip_prev)
+            geo_curr = geoip_resolver.lookup(ip_curr)
+            if not geo_prev or not geo_curr:
+                continue
+
+            lat1, lon1, city1, country1 = geo_prev
+            lat2, lon2, city2, country2 = geo_curr
+
+            distance = haversine(lat1, lon1, lat2, lon2)
+            time_diff = abs((dt_curr - dt_prev).total_seconds())
+
+            # Skip if same city/nearby (< 50 miles) — likely same location, different exit IPs
+            if distance < 50:
+                continue
+
+            if time_diff == 0:
+                speed = float("inf")
+            else:
+                speed = distance / (time_diff / 3600)  # mph
+
+            if speed > speed_threshold_mph:
+                seen_pairs.add(pair_key)
+                findings.append({
+                    "category": "IMPOSSIBLE_TRAVEL",
+                    "severity": "HIGH" if speed > 2000 else "MEDIUM",
+                    "user": user,
+                    "ip_from": ip_prev,
+                    "loc_from": f"{city1}, {country1}",
+                    "time_from": dt_prev.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "event_from": ev_prev.get("eventName", "?"),
+                    "ip_to": ip_curr,
+                    "loc_to": f"{city2}, {country2}",
+                    "time_to": dt_curr.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "event_to": ev_curr.get("eventName", "?"),
+                    "distance_miles": round(distance, 1),
+                    "time_delta_min": round(time_diff / 60, 1),
+                    "implied_speed_mph": round(speed, 1) if speed != float("inf") else "instant",
+                })
+
+    findings.sort(key=lambda f: 0 if f["severity"] == "HIGH" else 1)
+    return findings
+
+
 # ── ML-based anomaly detection (Isolation Forest) ────────────────────────────
 
 
@@ -710,7 +869,7 @@ def featurize_events(events, baseline=None):
     return np.array(features)
 
 
-def analyze_with_ml(events, baseline=None, contamination=0.05, top_n=20):
+def analyze_with_ml(events, baseline=None, contamination=0.05, top_n=20, geoip_resolver=None):
     """Run Isolation Forest on featurized CloudTrail events.
 
     Returns a list of anomaly dicts sorted by anomaly score (most anomalous first).
@@ -751,10 +910,20 @@ def analyze_with_ml(events, baseline=None, contamination=0.05, top_n=20):
             )[:3]
             reasons = [f"{fn}={fv:.2f}" for fn, fv in top_feats]
 
+            geo = None
+            if geoip_resolver:
+                ip = ev.get("sourceIPAddress", "")
+                if _is_public_ip(ip):
+                    geo_result = geoip_resolver.lookup(ip)
+                    if geo_result:
+                        geo = {"city": geo_result[2], "country": geo_result[3],
+                               "lat": geo_result[0], "lon": geo_result[1]}
+
             anomalies.append({
                 "event": ev,
                 "score": float(score),
                 "top_features": reasons,
+                "geo": geo,
             })
 
     anomalies.sort(key=lambda a: a["score"])
@@ -790,9 +959,9 @@ Output ONLY the JSON objects, one per line. If no anomalies are found, output:
 """
 
 
-def build_event_summary(ev):
+def build_event_summary(ev, geoip_resolver=None):
     """Compact single-event summary for the AI prompt."""
-    return {
+    summary = {
         "eventName": ev.get("eventName"),
         "eventSource": ev.get("eventSource"),
         "eventTime": ev.get("eventTime"),
@@ -806,9 +975,20 @@ def build_event_summary(ev):
         "errorCode": ev.get("errorCode"),
         "errorMessage": ev.get("errorMessage"),
     }
+    # Annotate with geolocation for LLM context
+    if geoip_resolver:
+        ip = ev.get("sourceIPAddress", "")
+        if _is_public_ip(ip):
+            geo = geoip_resolver.lookup(ip)
+            if geo:
+                summary["geoLocation"] = {
+                    "city": geo[2], "country": geo[3],
+                    "lat": geo[0], "lon": geo[1],
+                }
+    return summary
 
 
-def analyze_with_ai(events, batch_size=20):
+def analyze_with_ai(events, batch_size=20, geoip_resolver=None):
     """Send event batches to local LM Studio model for anomaly analysis."""
     client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
     findings = []
@@ -818,7 +998,7 @@ def analyze_with_ai(events, batch_size=20):
 
     for idx, batch in enumerate(batches, 1):
         print(f"{CYAN}AI analysis: batch {idx}/{total} ({len(batch)} events)...{RESET}")
-        summaries = [build_event_summary(ev) for ev in batch]
+        summaries = [build_event_summary(ev, geoip_resolver=geoip_resolver) for ev in batch]
 
         try:
             response = client.chat.completions.create(
@@ -862,7 +1042,7 @@ def severity_rank(sev):
     return {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}.get(sev, 5)
 
 
-def print_report(flagged, stats, new_activity, ml_anomalies, ai_findings):
+def print_report(flagged, stats, new_activity, travel_findings, ml_anomalies, ai_findings):
     """Print color-coded terminal report."""
     print(f"\n{BOLD}{'=' * 70}{RESET}")
     print(f"{BOLD}  CloudTrail AI Anomaly Report{RESET}")
@@ -877,6 +1057,7 @@ def print_report(flagged, stats, new_activity, ml_anomalies, ai_findings):
     print(f"  Tampering actions:       {stats['tamper_actions']}")
     print(f"  Network/SG changes:      {stats['network_changes']}")
     print(f"  STS assume-role denied:  {stats['sts_denied']}")
+    print(f"  Root account activity:   {stats.get('root_activity', 0)}")
     print()
 
     # Rule-based findings
@@ -893,7 +1074,7 @@ def print_report(flagged, stats, new_activity, ml_anomalies, ai_findings):
             ip = ev.get("sourceIPAddress", "?")
             for reason in item["reasons"]:
                 color = YELLOW
-                if "tampering" in reason.lower() or "privilege" in reason.lower():
+                if "tampering" in reason.lower() or "privilege" in reason.lower() or "root" in reason.lower():
                     color = RED
                 print(f"  {color}[!] {reason}{RESET}")
                 print(f"      Event: {name}  User: {user}  IP: {ip}  Time: {time}")
@@ -920,6 +1101,20 @@ def print_report(flagged, stats, new_activity, ml_anomalies, ai_findings):
     elif new_activity is not None and len(new_activity) == 0:
         print(f"{GREEN}No new activity vs. baseline.{RESET}\n")
 
+    # Impossible travel findings
+    if travel_findings:
+        print(f"{BOLD}── Impossible Travel Detection ({len(travel_findings)}) ──{RESET}\n")
+        for tf in travel_findings:
+            color = RED if tf["severity"] == "HIGH" else YELLOW
+            print(f"  {color}[{tf['severity']}] {tf['user']}{RESET}")
+            print(f"      From: {tf['ip_from']} ({tf['loc_from']}) at {tf['time_from']}  [{tf['event_from']}]")
+            print(f"      To:   {tf['ip_to']} ({tf['loc_to']}) at {tf['time_to']}  [{tf['event_to']}]")
+            speed_str = tf['implied_speed_mph'] if isinstance(tf['implied_speed_mph'], str) else f"{tf['implied_speed_mph']:,.0f}"
+            print(f"      Distance: {tf['distance_miles']:,.0f} mi  Time: {tf['time_delta_min']:.0f} min  Speed: {speed_str} mph")
+            print()
+    elif travel_findings is not None and len(travel_findings) == 0:
+        print(f"{GREEN}No impossible travel detected.{RESET}\n")
+
     # ML anomaly findings
     if ml_anomalies:
         print(f"{BOLD}── ML Anomaly Detection ({len(ml_anomalies)} top outliers) ──{RESET}\n")
@@ -944,8 +1139,13 @@ def print_report(flagged, stats, new_activity, ml_anomalies, ai_findings):
             else:
                 color = CYAN
 
+            geo_str = ""
+            geo = a.get("geo")
+            if geo:
+                geo_str = f"  Location: {geo['city']}, {geo['country']}"
+
             print(f"  {color}[score: {score:.3f}] {name}{RESET}")
-            print(f"      Service: {source}  User: {user}  IP: {ip}")
+            print(f"      Service: {source}  User: {user}  IP: {ip}{geo_str}")
             print(f"      Time: {time}" + (f"  Error: {error}" if error else ""))
             print(f"      Top features: {', '.join(a['top_features'])}")
             print()
@@ -971,7 +1171,7 @@ def print_report(flagged, stats, new_activity, ml_anomalies, ai_findings):
     print(f"{BOLD}{'=' * 70}{RESET}")
 
 
-def export_json(flagged, stats, new_activity, ml_anomalies, ai_findings, path):
+def export_json(flagged, stats, new_activity, travel_findings, ml_anomalies, ai_findings, path):
     """Write machine-readable JSON report."""
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1000,6 +1200,7 @@ def export_json(flagged, stats, new_activity, ml_anomalies, ai_findings, path):
             }
             for fa in (new_activity or [])
         ],
+        "impossible_travel": travel_findings or [],
         "ml_anomalies": [
             {
                 "eventName": a["event"].get("eventName"),
@@ -1013,6 +1214,7 @@ def export_json(flagged, stats, new_activity, ml_anomalies, ai_findings, path):
                 "errorCode": a["event"].get("errorCode"),
                 "anomaly_score": a["score"],
                 "top_features": a["top_features"],
+                "geo": a.get("geo"),
             }
             for a in (ml_anomalies or [])
         ],
@@ -1153,6 +1355,14 @@ def parse_args():
     parser.add_argument(
         "--batch-size", type=int, default=20, help="Events per AI batch (default: 20)"
     )
+    parser.add_argument(
+        "--geoip-db", metavar="FILE", default=None,
+        help="Path to MaxMind GeoLite2-City.mmdb for IP geolocation and impossible travel detection"
+    )
+    parser.add_argument(
+        "--travel-speed", type=float, default=500, metavar="MPH",
+        help="Impossible travel speed threshold in mph (default: 500)"
+    )
     return parser.parse_args()
 
 
@@ -1257,12 +1467,35 @@ def main():
         else:
             print(f"{CYAN}No new activity vs. baseline.{RESET}\n")
 
+    # 3.5 Initialize GeoIP resolver (used by travel detection, ML, and LLM tiers)
+    geoip_resolver = None
+    if args.geoip_db:
+        if not HAS_GEOIP:
+            print(f"{YELLOW}geoip2 package not installed. Run: pip install geoip2{RESET}")
+        elif not os.path.exists(args.geoip_db):
+            print(f"{YELLOW}GeoIP database not found: {args.geoip_db}{RESET}")
+        else:
+            geoip_resolver = GeoIPResolver(args.geoip_db)
+            print(f"{CYAN}GeoIP database loaded: {args.geoip_db}{RESET}")
+
+    # 3.6 Impossible travel detection (requires GeoIP)
+    travel_findings = None
+    if geoip_resolver:
+        print(f"{CYAN}Checking for impossible travel (threshold: {args.travel_speed} mph)...{RESET}")
+        travel_findings = detect_impossible_travel(events, geoip_resolver,
+                                                   speed_threshold_mph=args.travel_speed)
+        if travel_findings:
+            print(f"{CYAN}Found {len(travel_findings)} impossible travel finding(s).{RESET}\n")
+        else:
+            print(f"{CYAN}No impossible travel detected.{RESET}\n")
+
     # 4. ML anomaly detection (Isolation Forest with baseline context)
     ml_anomalies = None
     if not args.skip_ml:
         ml_anomalies = analyze_with_ml(
             events, baseline=baseline,
-            contamination=args.ml_contamination, top_n=args.ml_top_n
+            contamination=args.ml_contamination, top_n=args.ml_top_n,
+            geoip_resolver=geoip_resolver
         )
 
     # 5. LLM analysis (optional — only on ML-flagged events if ML ran)
@@ -1271,15 +1504,21 @@ def main():
         if ml_anomalies:
             anomaly_events = [a["event"] for a in ml_anomalies]
             print(f"{CYAN}Sending {len(anomaly_events)} ML-flagged events to LLM (instead of all {len(events)})...{RESET}")
-            ai_findings = analyze_with_ai(anomaly_events, batch_size=args.batch_size)
+            ai_findings = analyze_with_ai(anomaly_events, batch_size=args.batch_size,
+                                          geoip_resolver=geoip_resolver)
         else:
-            ai_findings = analyze_with_ai(events, batch_size=args.batch_size)
+            ai_findings = analyze_with_ai(events, batch_size=args.batch_size,
+                                          geoip_resolver=geoip_resolver)
 
     # 6. Report
-    print_report(flagged, stats, new_activity, ml_anomalies, ai_findings)
+    print_report(flagged, stats, new_activity, travel_findings, ml_anomalies, ai_findings)
 
     if args.output_json:
-        export_json(flagged, stats, new_activity, ml_anomalies, ai_findings, args.output_json)
+        export_json(flagged, stats, new_activity, travel_findings, ml_anomalies, ai_findings, args.output_json)
+
+    # Close GeoIP reader
+    if geoip_resolver:
+        geoip_resolver.close()
 
     # 7. Update and save baseline
     if not args.no_baseline:

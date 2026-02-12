@@ -12,6 +12,10 @@ reports/
 # Baseline (contains account-specific activity data)
 .cloudtrail_baseline.json
 
+# MaxMind GeoIP database (licensed, not for redistribution)
+maxmind/
+*.mmdb
+
 # IDE
 .vscode/
 .idea/
