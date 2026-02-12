@@ -16,11 +16,19 @@ REPORT_FILE="${REPORTS_DIR}/$(date +%F).daily-run.json"
 mkdir -p "${REPORTS_DIR}"
 
 echo "=== $(date) ===" >> "${LOG_FILE}"
+# Auto-detect GeoIP database for impossible travel detection
+GEOIP_DB="${PROJECT_DIR}/maxmind/GeoLite2-City.mmdb"
+GEOIP_FLAG=""
+if [ -f "${GEOIP_DB}" ]; then
+    GEOIP_FLAG="--geoip-db ${GEOIP_DB}"
+fi
+
 "${VENV_PYTHON}" "${ANALYZER}" \
     --s3-logs \
     --yesterday \
     --max-events 5000 \
     --skip-ai \
+    ${GEOIP_FLAG} \
     --output-json "${REPORT_FILE}" \
     >> "${LOG_FILE}" 2>&1
 echo "Exit code: $?" >> "${LOG_FILE}"
