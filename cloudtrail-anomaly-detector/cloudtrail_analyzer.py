@@ -413,9 +413,21 @@ def save_baseline(bl, path):
 
 
 def _event_user(ev):
-    """Extract a consistent user identifier from a CloudTrail event."""
+    """Extract a consistent user identifier from a CloudTrail event.
+
+    For assumed-role ARNs, strips the ephemeral session name so that the same
+    role with different session IDs (e.g. SecurityHub UUIDs) is treated as one
+    identity:
+      arn:aws:sts::123:assumed-role/MyRole/session-id → arn:aws:sts::123:assumed-role/MyRole
+    """
     uid = ev.get("userIdentity", {})
-    return uid.get("arn", "") or uid.get("userName", "") or ""
+    arn = uid.get("arn", "")
+    if arn and ":assumed-role/" in arn:
+        # arn:aws:sts::ACCT:assumed-role/ROLE_NAME/SESSION_NAME → drop /SESSION_NAME
+        parts = arn.split("/")
+        if len(parts) >= 3:
+            return "/".join(parts[:2])  # keep arn...assumed-role/ROLE_NAME
+    return arn or uid.get("userName", "") or ""
 
 
 def _event_date_str(ev):
