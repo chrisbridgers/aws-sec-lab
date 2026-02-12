@@ -44,9 +44,29 @@ python cloudtrail_analyzer.py --hours 24 --region us-east-1
 | `--profile` | default | AWS CLI profile name |
 | `--max-events` | 200 | Maximum events to retrieve |
 
-### Historical S3 Logs
+### Historical S3 Logs (auto-discover)
 
-For logs older than 90 days stored in S3. Point `--s3-uri` at the year-level prefix:
+Use `--s3-logs` to automatically discover your CloudTrail S3 bucket. The tool calls `describe_trails()` and `get_caller_identity()` to find the bucket, org ID, account ID, and region — no manual URI needed:
+
+```bash
+# Auto-discover bucket, specify date
+python cloudtrail_analyzer.py --s3-logs --year 2026 --month 1 --days 27
+
+# Auto-discover, different region
+python cloudtrail_analyzer.py --s3-logs --region us-west-2 --year 2026 --month 3 --days 15
+
+# Auto-discover, interactive prompts for month/day
+python cloudtrail_analyzer.py --s3-logs --year 2025
+
+# Auto-discover, current year (default)
+python cloudtrail_analyzer.py --s3-logs
+```
+
+The auto-discovery handles both organization trails (with `o-*` prefix) and standard trails automatically.
+
+### Historical S3 Logs (manual URI)
+
+Alternatively, point `--s3-uri` at the year-level prefix directly:
 
 ```bash
 python cloudtrail_analyzer.py \
@@ -55,7 +75,7 @@ python cloudtrail_analyzer.py \
 
 S3 log structure: `.../CloudTrail/region/YYYY/MM/DD/*.json.gz`
 
-When `--s3-uri` is used, the tool will interactively prompt for:
+When using `--s3-logs` or `--s3-uri` without `--month`/`--days`, the tool will interactively prompt for:
 
 1. **Month** (1-12) — numbered list of months
 2. **Day(s)** — single day, day range, or Enter for the entire month
@@ -64,14 +84,22 @@ To skip prompts (for scripting/CI), pass `--month` and `--days` on the command l
 
 ```bash
 # Single day
-python cloudtrail_analyzer.py --s3-uri "s3://bucket/.../2025/" --month 3 --days 15
+python cloudtrail_analyzer.py --s3-logs --year 2025 --month 3 --days 15
 
 # Day range
-python cloudtrail_analyzer.py --s3-uri "s3://bucket/.../2025/" --month 3 --days 10-20
+python cloudtrail_analyzer.py --s3-logs --year 2025 --month 3 --days 10-20
 
 # Entire month (prompted for day selection)
-python cloudtrail_analyzer.py --s3-uri "s3://bucket/.../2025/" --month 3
+python cloudtrail_analyzer.py --s3-logs --year 2025 --month 3
 ```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--s3-logs` | off | Auto-discover CloudTrail S3 bucket (no URI needed) |
+| `--s3-uri` | none | Manual S3 URI to CloudTrail year prefix |
+| `--year` | current year | Year for S3 log retrieval |
+| `--month` | prompted | Month (1-12) |
+| `--days` | prompted | Day or day range (e.g. `15` or `10-20`) |
 
 ### Baseline Options
 
@@ -82,7 +110,7 @@ The baseline file (`~/.cloudtrail_baseline.json`) persists across runs, accumula
 | `--baseline-file FILE` | `~/.cloudtrail_baseline.json` | Path to baseline JSON file |
 | `--no-baseline` | off | Disable baseline (single-run mode, no historical context) |
 | `--reset-baseline` | off | Delete existing baseline and start fresh |
-| `--yesterday` | off | Analyze yesterday's S3 logs (requires `--s3-uri`) |
+| `--yesterday` | off | Analyze yesterday's S3 logs (requires `--s3-uri` or `--s3-logs`) |
 
 ### Analysis Options
 
@@ -98,25 +126,22 @@ The baseline file (`~/.cloudtrail_baseline.json`) persists across runs, accumula
 ### Examples
 
 ```bash
-# First run: build baseline from a known-good day
+# First run: build baseline from a known-good day (auto-discover bucket)
 python cloudtrail_analyzer.py \
-  --s3-uri "s3://bucket/.../2026/" \
-  --month 1 --days 20 \
+  --s3-logs --year 2026 --month 1 --days 20 \
   --max-events 5000 --skip-ai
 
 # Second run: analyze a different day with baseline context
 python cloudtrail_analyzer.py \
-  --s3-uri "s3://bucket/.../2026/" \
-  --month 1 --days 28 \
+  --s3-logs --year 2026 --month 1 --days 28 \
   --max-events 5000 --skip-ai
 
 # Daily cron job: analyze yesterday, grow baseline, export JSON
 python cloudtrail_analyzer.py \
-  --s3-uri "s3://bucket/.../2026/" \
-  --yesterday --max-events 5000 \
+  --s3-logs --yesterday --max-events 5000 \
   --skip-ai --output-json /reports/$(date +%F).json
 
-# Full pipeline with all 4 tiers
+# Full pipeline with all 4 tiers (live API, last 48 hours)
 python cloudtrail_analyzer.py --hours 48 --output-json report.json
 
 # Single-run mode (no baseline), rules + ML only
@@ -124,9 +149,17 @@ python cloudtrail_analyzer.py --hours 24 --no-baseline --skip-ai
 
 # Reset baseline and start fresh
 python cloudtrail_analyzer.py \
-  --s3-uri "s3://bucket/.../2026/" \
-  --month 1 --days 15-20 \
+  --s3-logs --year 2026 --month 1 --days 15-20 \
   --reset-baseline --max-events 10000 --skip-ai
+
+# Analyze a different region
+python cloudtrail_analyzer.py \
+  --s3-logs --region us-west-2 --year 2026 --month 2 --days 1
+
+# Manual S3 URI (if auto-discover isn't suitable)
+python cloudtrail_analyzer.py \
+  --s3-uri "s3://bucket/AWSLogs/.../CloudTrail/us-east-1/2025/" \
+  --month 12 --days 25
 ```
 
 ## Detection Pipeline
