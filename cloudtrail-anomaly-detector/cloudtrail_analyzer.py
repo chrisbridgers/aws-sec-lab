@@ -1378,6 +1378,17 @@ def parse_days_arg(days_str):
 def main():
     args = parse_args()
 
+    # Expand {date} placeholder in --output-json (for launchd/cron without shell)
+    if args.output_json and "{date}" in args.output_json:
+        today = datetime.now().strftime("%Y-%m-%d")
+        args.output_json = args.output_json.replace("{date}", today)
+
+    # Ensure output directory exists
+    if args.output_json:
+        out_dir = os.path.dirname(args.output_json)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
     # Auto-discover S3 URI if --s3-logs is set
     if args.s3_logs and not args.s3_uri:
         print(f"{CYAN}Auto-discovering CloudTrail S3 configuration...{RESET}")
